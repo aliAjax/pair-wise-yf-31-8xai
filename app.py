@@ -6,8 +6,10 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,9 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
+DEFAULT_SLOT_CAPACITY = 8
+SLOT_BLOCK_MINUTES = 60
+RUNWAYS = ("departure", "arrival")
 
 
 class ApiError(Exception):
@@ -54,11 +59,26 @@ def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datet
 
 class Repository:
     def __init__(self, db_path: str | Path):
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.db_path = str(db_path)
+        self._local = threading.local()
+        init = self.conn
+        init.execute("PRAGMA journal_mode=WAL")
         self._init()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None, timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=15000")
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        connection = getattr(self._local, "conn", None)
+        if connection is None:
+            connection = self._connect()
+            self._local.conn = connection
+        return connection
 
     @contextmanager
     def tx(self):
@@ -96,6 +116,28 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ferry_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ferry_no TEXT NOT NULL UNIQUE,
+                aircraft_id TEXT NOT NULL REFERENCES aircraft(id), origin TEXT NOT NULL, destination TEXT NOT NULL,
+                earliest_start TEXT NOT NULL, turnaround_minutes INTEGER NOT NULL DEFAULT 45,
+                status TEXT NOT NULL DEFAULT 'draft', plan_id INTEGER REFERENCES recovery_plans(id),
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ferry_segments(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ferry_id INTEGER NOT NULL REFERENCES ferry_requests(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL, origin TEXT NOT NULL, destination TEXT NOT NULL,
+                std TEXT NOT NULL, sta TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', queued_at TEXT NOT NULL,
+                UNIQUE(ferry_id, seq)
+            );
+            CREATE TABLE IF NOT EXISTS slot_occupancy(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, airport TEXT NOT NULL, slot_start TEXT NOT NULL, runway TEXT NOT NULL DEFAULT 'departure',
+                ferry_segment_id INTEGER NOT NULL REFERENCES ferry_segments(id) ON DELETE CASCADE, created_at TEXT NOT NULL,
+                UNIQUE(ferry_segment_id, runway)
+            );
+            CREATE TABLE IF NOT EXISTS slot_capacity(
+                airport TEXT NOT NULL, slot_start TEXT NOT NULL, runway TEXT NOT NULL, capacity INTEGER NOT NULL,
+                PRIMARY KEY(airport, slot_start, runway)
+            );
             """
         )
 
@@ -391,6 +433,7 @@ class AirlineRecoveryService:
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
         result["assignments"] = assignments
+        result["ferries"] = [self._ferry_detail(conn, r["id"]) for r in conn.execute("SELECT id FROM ferry_requests WHERE plan_id=? ORDER BY id", (plan_id,))]
         return result
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
@@ -410,7 +453,282 @@ class AirlineRecoveryService:
         conn = self.repo.conn
         flights = [dict(r) for r in conn.execute("SELECT * FROM flights ORDER BY std")]
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
-        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
+        ferries = [self._ferry_detail(conn, r["id"]) for r in conn.execute("SELECT id FROM ferry_requests ORDER BY id DESC LIMIT 20")]
+        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")],
+                "plans": plans, "ferries": ferries, "server_time": iso()}
+
+    # ------------------------------------------------------------------
+    # 调机 (ferry flight) management
+    # ------------------------------------------------------------------
+    def _slot_window(self, value: datetime) -> datetime:
+        return value.replace(minute=0, second=0, microsecond=0)
+
+    def _slot_capacity(self, conn: sqlite3.Connection, airport: str, window: datetime, runway: str) -> int:
+        row = conn.execute("SELECT capacity FROM slot_capacity WHERE airport=? AND slot_start=? AND runway=?",
+                           (airport, iso(window), runway)).fetchone()
+        return row["capacity"] if row else DEFAULT_SLOT_CAPACITY
+
+    def _slot_used(self, conn: sqlite3.Connection, airport: str, window: datetime, runway: str) -> int:
+        return conn.execute("SELECT COUNT(*) AS c FROM slot_occupancy WHERE airport=? AND slot_start=? AND runway=?",
+                            (airport, iso(window), runway)).fetchone()["c"]
+
+    def _segment_fits(self, conn: sqlite3.Connection, seg: dict[str, Any]) -> bool:
+        std, sta = parse_time(seg["std"]), parse_time(seg["sta"])
+        for airport, dt, runway in ((seg["origin"], std, "departure"), (seg["destination"], sta, "arrival")):
+            window = self._slot_window(dt)
+            if self._slot_used(conn, airport, window, runway) >= self._slot_capacity(conn, airport, window, runway):
+                return False
+        return True
+
+    def _release_segment(self, conn: sqlite3.Connection, seg_id: int) -> None:
+        conn.execute("DELETE FROM slot_occupancy WHERE ferry_segment_id=?", (seg_id,))
+
+    def _claim_segment(self, conn: sqlite3.Connection, seg: dict[str, Any]) -> None:
+        std, sta = parse_time(seg["std"]), parse_time(seg["sta"])
+        for airport, dt, runway in ((seg["origin"], std, "departure"), (seg["destination"], sta, "arrival")):
+            conn.execute("INSERT INTO slot_occupancy(airport,slot_start,runway,ferry_segment_id,created_at) VALUES(?,?,?,?,?)",
+                         (airport, iso(self._slot_window(dt)), runway, seg["id"], iso()))
+
+    def _process_queue(self, conn: sqlite3.Connection) -> None:
+        """Assign slots to queued segments in FIFO order as capacity frees up."""
+        rows = [dict(r) for r in conn.execute("SELECT * FROM ferry_segments WHERE status='queued' ORDER BY queued_at,id")]
+        for seg in rows:
+            if self._segment_fits(conn, seg):
+                self._claim_segment(conn, seg)
+                conn.execute("UPDATE ferry_segments SET status='assigned' WHERE id=?", (seg["id"],))
+
+    def _compute_earliest(self, conn: sqlite3.Connection, aircraft_id: str, origin: str, turnaround: int) -> datetime:
+        """Feasibility from the previous flight's landing location and time."""
+        prev = conn.execute("""SELECT * FROM flights WHERE aircraft_id=? AND status!='canceled' AND destination=?
+                               ORDER BY sta DESC LIMIT 1""", (aircraft_id, origin)).fetchone()
+        if prev:
+            return parse_time(prev["sta"]) + timedelta(minutes=turnaround)
+        any_prev = conn.execute("""SELECT * FROM flights WHERE aircraft_id=? AND status!='canceled' ORDER BY sta DESC LIMIT 1""",
+                                (aircraft_id,)).fetchone()
+        if any_prev:
+            raise ApiError(409, "ferry_infeasible",
+                           f"前任航班落地于 {any_prev['destination']}，与调机出发地 {origin} 不一致，无法在此位置调机")
+        raise ApiError(409, "ferry_infeasible", "未找到该飞机的前任航班，无法确定调机出发位置")
+
+    def _build_segments(self, origin: str, destination: str, earliest: datetime, turnaround: int,
+                        segments_in: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        if segments_in:
+            for i, item in enumerate(segments_in):
+                seg_origin = str(item.get("origin", "")).upper().strip()
+                seg_dest = str(item.get("destination", "")).upper().strip()
+                if not seg_origin or not seg_dest:
+                    raise ApiError(400, "invalid_segment", "航段 origin/destination 必填")
+                std, sta = parse_time(item.get("std")), parse_time(item.get("sta"))
+                if sta <= std:
+                    raise ApiError(400, "invalid_times", "航段到达时间必须晚于起飞时间")
+                if i == 0 and std < earliest:
+                    raise ApiError(409, "ferry_infeasible", f"首航段起飞早于前任航班落地后过站时刻 {iso(earliest)}")
+                if i > 0:
+                    prev = out[-1]
+                    if seg_origin != prev["destination"]:
+                        raise ApiError(409, "ferry_infeasible", f"航段 {i + 1} 出发地 {seg_origin} 与上一航段到达地 {prev['destination']} 不一致")
+                    if std < parse_time(prev["sta"]) + timedelta(minutes=turnaround):
+                        raise ApiError(409, "ferry_infeasible", f"航段 {i + 1} 与上一航段过站时间不足 {turnaround} 分钟")
+                out.append({"origin": seg_origin, "destination": seg_dest, "std": iso(std), "sta": iso(sta)})
+        else:
+            out.append({"origin": origin, "destination": destination,
+                        "std": iso(earliest), "sta": iso(earliest + timedelta(minutes=SLOT_BLOCK_MINUTES))})
+        return out
+
+    def _aircraft_overlaps(self, conn: sqlite3.Connection, aircraft_id: str, seg_rows: list[dict[str, Any]],
+                           exclude_ferry_id: int | None = None) -> bool:
+        for seg in seg_rows:
+            query = """SELECT fs.id FROM ferry_segments fs JOIN ferry_requests fr ON fr.id=fs.ferry_id
+                       WHERE fr.aircraft_id=? AND fr.status NOT IN ('canceled','completed') AND fs.status!='canceled'
+                       AND fs.std < ? AND fs.sta > ?"""
+            params: list[Any] = [aircraft_id, seg["sta"], seg["std"]]
+            if exclude_ferry_id:
+                query += " AND fr.id<>?"
+                params.append(exclude_ferry_id)
+            if conn.execute(query, params).fetchone():
+                return True
+        return False
+
+    def _get_ferry_by_no(self, conn: sqlite3.Connection, ferry_no: str) -> sqlite3.Row:
+        ferry = conn.execute("SELECT * FROM ferry_requests WHERE ferry_no=?", (ferry_no,)).fetchone()
+        if not ferry:
+            raise ApiError(404, "ferry_not_found", "调机单不存在")
+        return ferry
+
+    def _ferry_detail(self, conn: sqlite3.Connection, ferry_id: int) -> dict[str, Any]:
+        ferry = conn.execute("SELECT * FROM ferry_requests WHERE id=?", (ferry_id,)).fetchone()
+        if not ferry:
+            raise ApiError(404, "ferry_not_found", "调机单不存在")
+        segments = [dict(r) for r in conn.execute("SELECT * FROM ferry_segments WHERE ferry_id=? ORDER BY seq", (ferry_id,))]
+        for seg in segments:
+            seg["slots"] = [dict(r) for r in conn.execute(
+                "SELECT airport,slot_start,runway FROM slot_occupancy WHERE ferry_segment_id=? ORDER BY runway", (seg["id"],))]
+        result = dict(ferry)
+        result["segments"] = segments
+        return result
+
+    def create_ferry(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "ferry_forbidden", "当前角色不能申请调机")
+        aircraft_id = str(body.get("aircraft_id", "")).strip()
+        origin = str(body.get("origin", "")).upper().strip()
+        destination = str(body.get("destination", "")).upper().strip()
+        if not aircraft_id or not origin or not destination:
+            raise ApiError(400, "missing_fields", "aircraft_id、origin、destination 必填")
+        turnaround = body.get("turnaround_minutes", 45)
+        if not isinstance(turnaround, int) or turnaround < 0:
+            raise ApiError(400, "invalid_turnaround", "turnaround_minutes 必须是非负整数")
+        plan_id = body.get("plan_id")
+        if plan_id is not None and not isinstance(plan_id, int):
+            raise ApiError(400, "invalid_plan", "plan_id 必须是整数")
+        ferry_no = str(body.get("ferry_no", "")).strip() or None
+        with self.repo.tx() as conn:
+            if ferry_no:  # idempotent retry by ferry number
+                existing = conn.execute("SELECT * FROM ferry_requests WHERE ferry_no=?", (ferry_no,)).fetchone()
+                if existing:
+                    return self._ferry_detail(conn, existing["id"])
+            aircraft = conn.execute("SELECT * FROM aircraft WHERE id=?", (aircraft_id,)).fetchone()
+            if not aircraft or aircraft["status"] != "active":
+                raise ApiError(409, "resource_unavailable", f"飞机 {aircraft_id} 不可用")
+            earliest = self._compute_earliest(conn, aircraft_id, origin, turnaround)
+            seg_rows = self._build_segments(origin, destination, earliest, turnaround, body.get("segments"))
+            if self._aircraft_overlaps(conn, aircraft_id, seg_rows):
+                raise ApiError(409, "ferry_conflict", "同一架飞机在该时段已有调机占用，先占到时隙的一方继续")
+            if plan_id is not None and not conn.execute("SELECT 1 FROM recovery_plans WHERE id=?", (plan_id,)).fetchone():
+                raise ApiError(404, "plan_not_found", "恢复方案不存在")
+            if not ferry_no:
+                ferry_no = f"FR-{uuid.uuid4().hex[:8].upper()}"
+            cur = conn.execute("""INSERT INTO ferry_requests(ferry_no,aircraft_id,origin,destination,earliest_start,
+                                   turnaround_minutes,status,plan_id,created_by,created_at,updated_at)
+                                  VALUES(?,?,?,?,?,?,'planned',?,?,?,?)""",
+                               (ferry_no, aircraft_id, origin, destination, iso(earliest), turnaround, plan_id, actor, iso(), iso()))
+            now = iso()
+            for i, seg in enumerate(seg_rows, start=1):
+                conn.execute("""INSERT INTO ferry_segments(ferry_id,seq,origin,destination,std,sta,status,queued_at)
+                                VALUES(?,?,?,?,?,?, 'queued',?)""",
+                             (cur.lastrowid, i, seg["origin"], seg["destination"], seg["std"], seg["sta"], now))
+            self._process_queue(conn)
+            Repository.audit(conn, plan_id, actor, role, "ferry_created",
+                             {"ferry_no": ferry_no, "aircraft_id": aircraft_id, "segments": len(seg_rows)})
+            return self._ferry_detail(conn, cur.lastrowid)
+
+    def _requeue_ferry(self, conn: sqlite3.Connection, ferry: sqlite3.Row) -> None:
+        """Release unexecuted segments, recompute their times from the last executed segment, then re-allocate."""
+        fid = ferry["id"]
+        segments = [dict(r) for r in conn.execute("SELECT * FROM ferry_segments WHERE ferry_id=? ORDER BY seq", (fid,))]
+        last_exec = next((s for s in reversed(segments) if s["status"] == "executed"), None)
+        durations: dict[int, timedelta] = {}
+        for seg in segments:
+            if seg["status"] != "executed":
+                durations[seg["id"]] = parse_time(seg["sta"]) - parse_time(seg["std"])
+                self._release_segment(conn, seg["id"])
+                conn.execute("UPDATE ferry_segments SET status='queued',queued_at=? WHERE id=?", (iso(), seg["id"]))
+        cursor = parse_time(last_exec["sta"]) + timedelta(minutes=ferry["turnaround_minutes"]) if last_exec else parse_time(ferry["earliest_start"])
+        for seg in segments:
+            if seg["status"] == "executed":
+                continue
+            std = cursor
+            sta = std + durations[seg["id"]]
+            conn.execute("UPDATE ferry_segments SET std=?,sta=? WHERE id=?", (iso(std), iso(sta), seg["id"]))
+            cursor = sta + timedelta(minutes=ferry["turnaround_minutes"])
+        new_status = "completed" if all(s["status"] == "executed" for s in segments) else "active"
+        conn.execute("UPDATE ferry_requests SET status=?,updated_at=? WHERE id=?", (new_status, iso(), fid))
+        self._process_queue(conn)
+
+    def execute_ferry_segment(self, ferry_no: str, seq: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "ferry_forbidden", "当前角色不能执行调机航段")
+        with self.repo.tx() as conn:
+            ferry = self._get_ferry_by_no(conn, ferry_no)
+            seg = conn.execute("SELECT * FROM ferry_segments WHERE ferry_id=? AND seq=?", (ferry["id"], seq)).fetchone()
+            if not seg:
+                raise ApiError(404, "segment_not_found", "调机航段不存在")
+            if seg["status"] == "executed":
+                return self._ferry_detail(conn, ferry["id"])
+            self._release_segment(conn, seg["id"])
+            conn.execute("UPDATE ferry_segments SET status='executed' WHERE id=?", (seg["id"],))
+            self._requeue_ferry(conn, ferry)
+            Repository.audit(conn, ferry["plan_id"], actor, role, "ferry_segment_executed", {"ferry_no": ferry_no, "seq": seq})
+            return self._ferry_detail(conn, ferry["id"])
+
+    def cancel_ferry(self, ferry_no: str, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "ferry_forbidden", "当前角色不能取消调机")
+        with self.repo.tx() as conn:
+            ferry = self._get_ferry_by_no(conn, ferry_no)
+            if ferry["status"] == "canceled":
+                return self._ferry_detail(conn, ferry["id"])
+            for seg in conn.execute("SELECT id FROM ferry_segments WHERE ferry_id=?", (ferry["id"],)):
+                self._release_segment(conn, seg["id"])
+            conn.execute("UPDATE ferry_segments SET status='canceled' WHERE ferry_id=?", (ferry["id"],))
+            conn.execute("UPDATE ferry_requests SET status='canceled',updated_at=? WHERE id=?", (iso(), ferry["id"]))
+            self._process_queue(conn)
+            Repository.audit(conn, ferry["plan_id"], actor, role, "ferry_canceled", {"ferry_no": ferry_no})
+            return self._ferry_detail(conn, ferry["id"])
+
+    def retry_ferry(self, ferry_no: str, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "ferry_forbidden", "当前角色不能重试调机")
+        with self.repo.tx() as conn:
+            ferry = self._get_ferry_by_no(conn, ferry_no)
+            if ferry["status"] in ("completed", "canceled"):
+                raise ApiError(409, "ferry_closed", "已结束的调机不能重试")
+            self._requeue_ferry(conn, ferry)
+            Repository.audit(conn, ferry["plan_id"], actor, role, "ferry_retried", {"ferry_no": ferry_no})
+            return self._ferry_detail(conn, ferry["id"])
+
+    def list_ferries(self) -> dict[str, Any]:
+        conn = self.repo.conn
+        ferries = [self._ferry_detail(conn, r["id"]) for r in conn.execute("SELECT id FROM ferry_requests ORDER BY id DESC")]
+        return {"ferries": ferries}
+
+    def get_ferry(self, ferry_no: str) -> dict[str, Any]:
+        conn = self.repo.conn
+        ferry = self._get_ferry_by_no(conn, ferry_no)
+        return self._ferry_detail(conn, ferry["id"])
+
+    def slot_view(self, airport: str, date_value: str) -> dict[str, Any]:
+        airport = airport.upper().strip()
+        try:
+            day = parse_time(date_value).replace(hour=0, minute=0, second=0, microsecond=0)
+        except ApiError:
+            raise ApiError(400, "invalid_date", "date 应为 ISO 8601 日期")
+        end = day + timedelta(days=1)
+        conn = self.repo.conn
+        rows = conn.execute("""SELECT so.*, fs.seq, fr.ferry_no, fr.aircraft_id
+                                FROM slot_occupancy so
+                                JOIN ferry_segments fs ON fs.id=so.ferry_segment_id
+                                JOIN ferry_requests fr ON fr.id=fs.ferry_id
+                                WHERE so.airport=? AND so.slot_start>=? AND so.slot_start<?
+                                ORDER BY so.slot_start,so.runway""", (airport, iso(day), iso(end))).fetchall()
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault((row["slot_start"], row["runway"]), []).append(dict(row))
+        slots: list[dict[str, Any]] = []
+        for hour in range(24):
+            window = day + timedelta(hours=hour)
+            for runway in RUNWAYS:
+                key = (iso(window), runway)
+                occupants = grouped.get(key, [])
+                slots.append({"airport": airport, "window": iso(window), "runway": runway,
+                              "capacity": self._slot_capacity(conn, airport, window, runway),
+                              "used": len(occupants), "occupants": occupants})
+        return {"airport": airport, "date": date_value, "slots": slots}
+
+    def set_slot_capacity(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "ops_manager":
+            raise ApiError(403, "slot_forbidden", "只有运行经理可以维护时隙容量")
+        airport = str(body.get("airport", "")).upper().strip()
+        runway = str(body.get("runway", "departure")).strip()
+        capacity = body.get("capacity")
+        window = parse_time(body.get("slot_start"))
+        if not airport or runway not in RUNWAYS or not isinstance(capacity, int) or capacity <= 0:
+            raise ApiError(400, "invalid_slot", "airport、slot_start、runway(departure/arrival) 和正整数 capacity 必填")
+        with self.repo.tx() as conn:
+            conn.execute("""INSERT OR REPLACE INTO slot_capacity(airport,slot_start,runway,capacity) VALUES(?,?,?,?)""",
+                         (airport, iso(window), runway, capacity))
+            return {"airport": airport, "slot_start": iso(window), "runway": runway, "capacity": capacity}
 
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -429,12 +747,19 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc: raise ApiError(400, "invalid_json", "请求体不是有效 JSON") from exc
         if not isinstance(value, dict): raise ApiError(400, "invalid_json", "请求体必须是对象")
         return value
-    def get_api(self, path: str) -> tuple[int, Any]:
+    def get_api(self, path: str, query_string: str = "") -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "airline-recovery"}
         actor, role = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state()
+        if path == "/api/ferries": return 200, self.service.list_ferries()
+        if path == "/api/slots":
+            query = parse_qs(query_string)
+            airport = (query.get("airport") or [""])[0]
+            date_value = (query.get("date") or [""])[0]
+            return 200, self.service.slot_view(airport, date_value)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 3 and parts[:2] == ["api", "ferries"]: return 200, self.service.get_ferry(parts[2])
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -447,6 +772,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/flights": lambda: (201, self.service.create_flight(actor, role, body)),
             "/api/disruptions": lambda: (201, self.service.create_disruption(actor, role, body)),
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
+            "/api/ferries": lambda: (201, self.service.create_ferry(actor, role, body)),
+            "/api/slots/capacity": lambda: (200, self.service.set_slot_capacity(actor, role, body)),
         }
         if path in table: return table[path]()
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
@@ -458,13 +785,19 @@ class Handler(BaseHTTPRequestHandler):
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
             if action == "recover": return 200, self.service.recover_flight(flight_id, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "ferries"]:
+            ferry_no, action = parts[2], parts[3]
+            if action == "retry": return 200, self.service.retry_ferry(ferry_no, actor, role)
+            if action == "cancel": return 200, self.service.cancel_ferry(ferry_no, actor, role)
+        if len(parts) == 6 and parts[:2] == ["api", "ferries"] and parts[3] == "segments" and parts[5] == "execute":
+            return 200, self.service.execute_ferry_segment(parts[2], int(parts[4]), actor, role)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-            status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path)
+            status, payload = self.get_api(parsed.path, parsed.query) if method == "GET" else self.post_api(parsed.path)
             respond(self, status, payload)
         except ApiError as exc:
             payload = {"error": exc.code, "message": exc.message}

@@ -21,6 +21,11 @@ python3 app.py --db airline_recovery.db
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
+- `POST /api/ferries`：申请调机（按调机编号幂等重试），按前任航班落地位置和时间算可行性，占用时隙容量，容量不足时排队；同一架飞机时段冲突时后到者看到冲突。
+- `GET /api/ferries`、`GET /api/ferries/{ferry_no}`：查看调机链与航段时隙占用。
+- `POST /api/ferries/{ferry_no}/retry`、`/cancel`：重试排队航段、取消调机并释放容量。
+- `POST /api/ferries/{ferry_no}/segments/{seq}/execute`：执行航段，未执行航段退回队列并重算。
+- `GET /api/slots?airport=&date=`、`POST /api/slots/capacity`：查看时隙占用、维护时隙容量。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
 
 ## 测试
