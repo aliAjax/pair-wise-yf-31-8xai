@@ -1,3 +1,102 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>调机恢复调度台</title>
+<style>
+body{font:14px system-ui;max-width:1200px;margin:30px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:18px;border-radius:12px;margin:14px 0;box-shadow:0 2px 10px #0001}
+h1{margin-bottom:4px}.sub{color:#5b6b7f;margin-top:0}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #e6ebf2;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f6f8fb;position:sticky;top:0}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.scheduled{background:#0f766e}.queued{background:#b45309}.departed{background:#2563eb}.arrived{background:#15803d}
+.canceled{background:#6b7280}.in_progress{background:#2563eb}.completed{background:#15803d}.proposed{background:#6b7280}
+.bar{background:#e5e7eb;border-radius:6px;overflow:hidden;height:18px;min-width:90px;position:relative}
+.bar i{display:block;height:100%;background:#0f766e}.bar span{position:absolute;right:6px;top:0;font-size:11px;line-height:18px;color:#334155}
+.bar.full i{background:#b45309}
+input,button,textarea,select{font:inherit;padding:7px;margin:3px}button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+textarea{width:100%;height:120px}pre{background:#111827;color:#93c5fd;padding:12px;overflow:auto;border-radius:8px;font-size:12px}
+.muted{color:#7a8aa0;font-size:12px}.flex{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+</style>
+<h1>调机恢复调度台</h1>
+<p class="sub">手工拼调机链接入恢复方案；按前任航班落地位置/时间校验，占用机场时隙，容量不足 FIFO 排队。写操作需携带 X-User-Id、X-Role。</p>
+
+<section>
+  <div class="flex">
+    <label>用户 <input id="u" value="ops" size="8"></label>
+    <label>角色
+      <select id="r"><option>ops_manager</option><option>scheduler</option><option>auditor</option><option>viewer</option></select>
+    </label>
+    <label>时隙机场筛选 <input id="airport" value="" size="6" placeholder="如 BBB"></label>
+    <label>日期 <input id="date" type="date"></label>
+    <button onclick="load()">刷新</button>
+    <span class="muted" id="clock"></span>
+  </div>
+</section>
+
+<section>
+  <h3>调机链</h3>
+  <table><thead><tr><th>调机编号</th><th>方案</th><th>飞机</th><th>状态</th><th>航段（起→落 / 状态 / 排定时间 / 队列位置）</th></tr></thead>
+  <tbody id="ferries"></tbody></table>
+  <h3>时隙等待队列</h3>
+  <table><thead><tr><th>顺序</th><th>调机</th><th>段</th><th>飞机</th><th>需求</th><th>排队时间</th></tr></thead><tbody id="queue"></tbody></table>
+</section>
+
+<section>
+  <h3>机场时隙占用</h3>
+  <table><thead><tr><th>机场</th><th>窗口</th><th>占用/容量</th><th>占用明细</th></tr></thead><tbody id="slots"></tbody></table>
+</section>
+
+<section>
+  <h3>提交调机（手工拼链）</h3>
+<textarea id="payload">{
+  "ferry_id": "FY-DEMO",
+  "aircraft_id": "AC1",
+  "plan_id": null,
+  "legs": [
+    {"origin": "BBB", "destination": "AAA", "duration_minutes": 60, "ground_minutes": 30,
+     "predecessor_kind": "flight", "predecessor_ref": 1}
+  ]
+}</textarea>
+  <button onclick="postFerry()">提交调机</button>
+  <button onclick="load()">刷新结果</button>
+  <pre id="result" class="muted">响应将显示在这里</pre>
+</section>
+
+<script>
+function headers(){return {'X-User-Id':u.value,'X-Role':r.value}}
+const tag=s=>`<span class="tag ${s}">${s}</span>`
+async function load(){
+  const state=await (await fetch('/api/state',{headers:headers()})).json()
+  clock.textContent='服务器时间 '+state.server_time
+  ferries.innerHTML=(state.ferries||[]).map(f=>`<tr>
+    <td>${f.id}</td><td>${f.plan_id??'—'}</td><td>${f.aircraft_id}</td><td>${tag(f.status)}</td>
+    <td><table>${f.legs.map(l=>`<tr><td>${l.origin}→${l.destination}</td><td>${tag(l.status)}</td>
+      <td>${l.scheduled_std?('起 '+l.scheduled_std+' / 落 '+l.scheduled_sta):'最早起 '+l.earliest_std}</td>
+      <td>${l.queue_position?('队列第 '+l.queue_position):''}</td></tr>`).join('')}</table></td></tr>`).join('')
+    || '<tr><td colspan=5 class="muted">暂无调机</td></tr>'
+  queue.innerHTML=(state.ferry_queue||[]).map(q=>`<tr><td>${q.queue_position}</td><td>${q.ferry_id}</td>
+    <td>#${q.seq}</td><td>${q.aircraft_id}</td><td>${q.origin}→${q.destination}</td><td>${q.queued_at}</td></tr>`).join('')
+    || '<tr><td colspan=6 class="muted">队列为空</td></tr>'
+  const qs=new URLSearchParams()
+  if(airport.value.trim())qs.set('airport',airport.value.trim().toUpperCase())
+  if(date.value)qs.set('date',date.value)
+  const slots=await (await fetch('/api/slots?'+qs.toString(),{headers:headers()})).json()
+  slots.innerHTML=null
+  document.getElementById('slots').innerHTML=(slots.windows||[]).map(w=>{
+    const pct=Math.round(w.used/w.capacity*100)
+    return `<tr><td>${w.airport}</td><td>${w.window_start} ~ ${w.window_end}</td>
+      <td><div class="bar ${w.used>=w.capacity?'full':''}"><i style="width:${pct}%"></i><span>${w.used}/${w.capacity} 余${w.available}</span></div></td>
+      <td>${w.reservations.filter(x=>x.status==='held').map(x=>`${x.ferry_id}#${x.seq} ${x.movement==='departure'?'起飞':'落地'} [${x.status}]`).join('<br>')||'<span class=muted>—</span>'}</td></tr>`
+  }).join('')||'<tr><td colspan=4 class="muted">暂无窗口（有调机提交后自动生成）</td></tr>'
+}
+async function postFerry(){
+  let body
+  try{body=JSON.parse(payload.value)}catch(e){result.textContent='JSON 解析失败: '+e;return}
+  const resp=await fetch('/api/ferries',{method:'POST',headers:{'Content-Type':'application/json',...headers()},body:JSON.stringify(body)})
+  result.textContent=JSON.stringify(await resp.json(),null,2)
+  load()
+}
+load()
+</script>
+</html>

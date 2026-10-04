@@ -23,6 +23,19 @@ python3 app.py --db airline_recovery.db
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
 
+## 调机链与时隙
+
+外地抛锚时手工拼调机并接入恢复方案：
+
+- `POST /api/ferries`：提交调机链。`ferry_id` 为客户端指定编号；`plan_id` 可挂到草稿方案；`legs[]` 按顺序给出 `origin/destination/duration_minutes/ground_minutes`，首段可用 `predecessor_kind="flight"` + `predecessor_ref` 串接前任航班（后续航段自动链接，起点必须等于上一段落地）。系统按前任落地机场和落地时间计算最早可行性；为每段的起飞、落地机场在时间窗口上占用一条时隙（`held`）。
+- 时隙容量：机场按 `slot_window_minutes`（默认 60）切窗，`slot_capacity`（默认 3）为每窗容量，`slot_horizon_windows`（默认 24）为向前搜索的窗口数。容量不足时航段保持 `queued` 并入 FIFO 队列；任何释放（落地、取消、退回）都会触发队首重算。
+- 同一架飞机并发提交：写事务经 `BEGIN IMMEDIATE` + 进程锁串行仲裁，先占到时隙者继续，后到者收到 `409 ferry_aircraft_conflict`。与已锁定方案的航班重叠同样拒绝。
+- `POST /api/ferries/{id}`：事件 `depart` / `arrive`（可带 `at`）/ `cancel_leg` / `cancel`，均需 `expected_revision`。航段状态一变，后续未执行航段立即释放占用、退回队列并按新的落地位置和时间重算；落地/取消后腾出的容量只计一次（条件 UPDATE 幂等，同一航段有唯一占用索引）。
+- 写入失败重试：用相同 `ferry_id` 与相同载荷重试是幂等的（返回已有调机）；编号被不同内容占用则返回 `409 ferry_id_conflict`。
+- 方案锁定 `POST /api/plans/{id}/lock`：方案下若有调机航段仍在排队（`ferry_not_ready/ferry_legs_waiting`）或与其他调机存在同机重叠则拒绝；锁定成功后调机时隙从 `held` 转为 `confirmed`。
+- `POST /api/slot-config`：运行经理调整机场窗口分钟数、容量、前瞻窗口数（已建窗口不变，后续新窗口生效）。
+- 调度台视图：`GET /api/ferries?plan_id=`（调机链、每段状态和队列位置）、`GET /api/slots?airport=&date=YYYY-MM-DD`（窗口占用/余量、占用明细、等待航段），首页 `/` 图形化展示调机链、等待队列和时隙占用。
+
 ## 测试
 
 ```bash
